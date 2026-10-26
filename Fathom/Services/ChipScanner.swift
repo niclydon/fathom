@@ -1,9 +1,10 @@
 import CoreNFC
+import CryptoKit
 import Foundation
 import UIKit
 
-/// One completed (or attempted) implant scan, as the spike reports it.
-struct ScanRecord: Identifiable, Equatable {
+/// One completed chip scan, in the form enrollment and the gate compare.
+struct ChipScan: Identifiable, Equatable {
     var id = UUID()
     var at: Date
     var tagType: String
@@ -12,7 +13,10 @@ struct ScanRecord: Identifiable, Equatable {
     var extra: [String]
     var ndefStatus: String
     var ndefCapacity: Int?
-    var ndefRecords: [String]
+    var ndefRecordDescriptions: [String]
+    /// SHA-256 over the full NDEF message (record headers + payloads),
+    /// hex. Empty when no NDEF message could be read.
+    var ndefHashHex: String
     var errorText: String?
 
     var reportText: String {
@@ -25,11 +29,12 @@ struct ScanRecord: Identifiable, Equatable {
         for e in extra { lines.append(e) }
         lines.append("NDEF status: \(ndefStatus)")
         if let cap = ndefCapacity { lines.append("NDEF capacity: \(cap) bytes") }
-        if ndefRecords.isEmpty {
+        lines.append("NDEF hash (sha256): \(ndefHashHex.isEmpty ? "(none)" : ndefHashHex)")
+        if ndefRecordDescriptions.isEmpty {
             lines.append("NDEF records: none read")
         } else {
-            lines.append("NDEF records (\(ndefRecords.count)):")
-            lines.append(contentsOf: ndefRecords)
+            lines.append("NDEF records (\(ndefRecordDescriptions.count)):")
+            lines.append(contentsOf: ndefRecordDescriptions)
         }
         if let errorText { lines.append("error: \(errorText)") }
         return lines.joined(separator: "\n")
@@ -41,29 +46,36 @@ extension Data {
     var hexCompact: String { map { String(format: "%02x", $0) }.joined() }
 }
 
-/// Core NFC tag scanner for the Fathom spike (and, later, the Descent).
+/// Core NFC tag scanner for the Descent.
 ///
-/// Polls ISO 14443, ISO 15693 and FeliCa (ISO 18092). For each tag it
-/// reports the type, the identifier exactly as iOS exposes it, any
-/// type-specific fields, and the full NDEF message when readable.
-/// Nothing is written to a tag, ever, in the spike.
-final class NFCScanner: NSObject, ObservableObject {
-    @Published var scans: [ScanRecord] = []
+/// Polls ISO 14443, ISO 15693 and FeliCa (ISO 18092), connects to the
+/// first tag, reads its identifier per type, and reads the full NDEF
+/// message. It never writes to a tag.
+///
+/// Tier-1 possession factor, honestly: the identifier and the NDEF
+/// message are static and cloneable. This scan proves the enrolled
+/// chip (or a copy of its contents) is physically present; the World
+/// ID presence proof that follows is what binds it to a person.
+final class ChipScanner: NSObject, ObservableObject {
+    @Published var scans: [ChipScan] = []
     @Published var lastError: String?
     @Published var isScanning = false
 
     private var session: NFCTagReaderSession?
+    private var completion: ((ChipScan?) -> Void)?
 
     var readingAvailable: Bool { NFCTagReaderSession.readingAvailable }
 
-    func startScan() {
+    func startScan(completion: ((ChipScan?) -> Void)? = nil) {
         guard NFCTagReaderSession.readingAvailable else {
             lastError = "NFC tag reading is not available on this device."
+            completion?(nil)
             return
         }
         lastError = nil
+        self.completion = completion
         let newSession = NFCTagReaderSession(pollingOption: [.iso14443, .iso15693, .iso18092], delegate: self, queue: nil)
-        newSession?.alertMessage = "Hold the top edge of your phone to the back of your hand, over the chip."
+        newSession?.alertMessage = "Hold the top edge of your phone to your mark."
         self.session = newSession
         isScanning = true
         newSession?.begin()
@@ -71,7 +83,7 @@ final class NFCScanner: NSObject, ObservableObject {
 
     var fullReport: String {
         var lines: [String] = []
-        lines.append("FATHOM NFC SPIKE REPORT")
+        lines.append("FATHOM CHIP DIAGNOSTICS")
         lines.append("device iOS: \(UIDevice.current.systemVersion)")
         lines.append("scans: \(scans.count)")
         lines.append("")
@@ -79,15 +91,13 @@ final class NFCScanner: NSObject, ObservableObject {
             lines.append(scan.reportText)
             lines.append("")
         }
-        // Identifier stability across repeated scans, grouped by identifier.
         let groups = Dictionary(grouping: scans, by: { $0.identifierHex })
         if scans.count > 1 {
             lines.append("STABILITY")
             for (idHex, group) in groups.sorted(by: { $0.key < $1.key }) where !idHex.isEmpty {
-                lines.append("identifier \(idHex): seen \(group.count)x, types: \(Set(group.map(\.tagType)).sorted().joined(separator: ", "))")
+                lines.append("identifier \(idHex): seen \(group.count)x, types: \(Set(group.map(\.tagType)).sorted().joined(separator: ", ")), ndef hashes: \(Set(group.map(\.ndefHashHex)).sorted().joined(separator: ", "))")
             }
-            let distinct = groups.keys.filter { !$0.isEmpty }.count
-            lines.append("distinct identifiers: \(distinct)")
+            lines.append("distinct identifiers: \(groups.keys.filter { !$0.isEmpty }.count)")
         }
         return lines.joined(separator: "\n")
     }
@@ -102,7 +112,6 @@ final class NFCScanner: NSObject, ObservableObject {
         if let text = String(data: payload.payload, encoding: .utf8), !text.isEmpty {
             parts.append("    payload utf8 (raw): \(text)")
         }
-        // Well-known URI record ("U"): first payload byte is a prefix code.
         if typeString == "U", let first = payload.payload.first {
             let prefixes: [UInt8: String] = [
                 0x00: "", 0x01: "http://www.", 0x02: "https://www.", 0x03: "http://",
@@ -113,7 +122,6 @@ final class NFCScanner: NSObject, ObservableObject {
             let rest = String(data: payload.payload.dropFirst(), encoding: .utf8) ?? ""
             parts.append("    decoded URI: \((prefixes[first] ?? "<prefix 0x\(String(format: "%02x", first))>") + rest)")
         }
-        // Well-known Text record ("T"): status byte, language, then text.
         if typeString == "T", let first = payload.payload.first {
             let langLen = Int(first & 0x3F)
             let lang = String(data: payload.payload.dropFirst().prefix(langLen), encoding: .ascii) ?? ""
@@ -123,29 +131,50 @@ final class NFCScanner: NSObject, ObservableObject {
         return parts.joined(separator: "\n")
     }
 
-    private func finish(_ record: ScanRecord, session: NFCTagReaderSession, alert: String) {
+    private func hashNDEF(_ message: NFCNDEFMessage) -> String {
+        var hasher = SHA256()
+        for record in message.records {
+            hasher.update(data: Data([record.typeNameFormat.rawValue]))
+            hasher.update(data: record.type)
+            hasher.update(data: record.identifier)
+            hasher.update(data: record.payload)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func finish(_ record: ChipScan, session: NFCTagReaderSession, alert: String) {
+        let completion = self.completion
+        self.completion = nil
         DispatchQueue.main.async {
-            self.scans.append(record)
+            if record.identifierHex != "" || record.errorText != nil {
+                self.scans.append(record)
+            }
             self.isScanning = false
             if record.errorText == nil {
                 UINotificationFeedbackGenerator().notificationOccurred(.success)
             }
+            completion?(record.errorText == nil ? record : nil)
         }
         session.alertMessage = alert
         session.invalidate()
     }
 }
 
-extension NFCScanner: NFCTagReaderSessionDelegate {
+extension ChipScanner: NFCTagReaderSessionDelegate {
     func tagReaderSessionDidBecomeActive(_ session: NFCTagReaderSession) {}
 
     func tagReaderSession(_ session: NFCTagReaderSession, didInvalidateWithError error: Error) {
+        let completion = self.completion
+        self.completion = nil
         DispatchQueue.main.async {
             self.isScanning = false
             let code = (error as NSError).code
-            // 200 = user cancelled the system scan sheet; not an error to report.
+            // 200 = user cancelled the system scan sheet; not an error.
             if code != 200 {
                 self.lastError = error.localizedDescription
+                completion?(nil)
+            } else {
+                completion?(nil)
             }
         }
     }
@@ -155,7 +184,7 @@ extension NFCScanner: NFCTagReaderSessionDelegate {
         session.connect(to: tag) { [weak self] error in
             guard let self else { return }
             if let error {
-                var record = ScanRecord(at: Date(), tagType: "unknown", identifierHex: "", identifierByteCount: 0, extra: [], ndefStatus: "not queried", ndefRecords: [])
+                var record = ChipScan(at: Date(), tagType: "unknown", identifierHex: "", identifierByteCount: 0, extra: [], ndefStatus: "not queried", ndefRecordDescriptions: [], ndefHashHex: "")
                 record.errorText = "connect failed: \(error.localizedDescription)"
                 self.finish(record, session: session, alert: "Could not connect to that chip. Try again.")
                 return
@@ -197,14 +226,15 @@ extension NFCScanner: NFCTagReaderSessionDelegate {
             tagType = "unknown (future type)"
         }
 
-        var record = ScanRecord(
+        var record = ChipScan(
             at: Date(),
             tagType: tagType,
             identifierHex: identifier.hexString,
             identifierByteCount: identifier.count,
             extra: extra,
             ndefStatus: "not queried",
-            ndefRecords: []
+            ndefRecordDescriptions: [],
+            ndefHashHex: ""
         )
 
         guard let ndefTag else {
@@ -237,7 +267,8 @@ extension NFCScanner: NFCTagReaderSessionDelegate {
                     return
                 }
                 if let message {
-                    record.ndefRecords = message.records.map { self.decodePayload($0) }
+                    record.ndefRecordDescriptions = message.records.map { self.decodePayload($0) }
+                    record.ndefHashHex = self.hashNDEF(message)
                 }
                 self.finish(record, session: session, alert: "Chip read.")
             }

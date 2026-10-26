@@ -18,7 +18,73 @@ fathoms down, with a members' ledger, a nightly program, a cellar list,
 house rules, and a local note board. All demo content is fictional and
 SFW.
 
-> Status: work in progress. The NFC spike lands first; see below.
+> Status: v0.1. The app ships with a built-in chip diagnostics screen
+> (About → Chip Diagnostics) that reports exactly what iOS exposes for
+> a given tag — type, identifier, NDEF status and contents, and a
+> cross-scan stability summary — because enrollment was designed
+> against real scans of real chips, not assumptions.
+
+## The sequence
+
+Enrollment binds the chip and the nullifier as a pair:
+
+```mermaid
+sequenceDiagram
+    actor Member
+    participant App
+    participant Chip
+    participant Backend as fathom-gate
+    participant World as World App / Portal
+    Member->>App: "Bind your mark"
+    App->>Chip: Scan (1 of 2)
+    Chip-->>App: identifier + NDEF
+    App->>Chip: Scan (2 of 2)
+    Chip-->>App: identifier + NDEF (must agree)
+    App->>App: Store identifier + NDEF hash in Keychain
+    App->>Backend: Signed rp_context request
+    Backend-->>App: rp_context
+    App->>World: Proof of Presence (create session)
+    World-->>App: Session proof
+    App->>Backend: Verify (flow: enroll)
+    Backend->>World: Portal verify
+    World-->>Backend: Verified
+    Backend->>Backend: Store session id + nullifier SHA-256
+    Backend-->>App: Verified — binding complete
+```
+
+Unlock is both factors, in order, inside 120 seconds:
+
+```mermaid
+sequenceDiagram
+    actor Member
+    participant App
+    participant Chip
+    participant Backend as fathom-gate
+    participant World as World App / Portal
+    Member->>App: "Present your mark" (Step A)
+    App->>Chip: Scan
+    Chip-->>App: identifier + NDEF
+    App->>App: Match against enrollment?
+    alt no match
+        App-->>Member: Fail closed, sequence restarts
+    else match
+        App->>App: Arm Step B for 120 seconds
+        Member->>App: "Prove you're you" (Step B)
+        App->>Backend: Signed rp_context request
+        Backend-->>App: rp_context
+        App->>World: Proof of Presence (prove session)
+        World-->>App: Session proof
+        App->>Backend: Verify (flow: prove)
+        Backend->>World: Portal verify
+        World-->>Backend: Verified
+        Backend->>Backend: Session matches enrolled, no replay
+        Backend-->>App: Verified
+        App-->>Member: The club opens
+    end
+```
+
+Inside, "Return to the surface" locks immediately, and backgrounding
+the app for more than 60 seconds relocks it.
 
 ## Honest security model
 

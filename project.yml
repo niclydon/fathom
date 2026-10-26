@@ -20,6 +20,8 @@ targets:
   Fathom:
     type: application
     platform: iOS
+    dependencies:
+      - package: IDKit
     sources:
       - path: Fathom
     entitlements:
