@@ -1,0 +1,1 @@
+{"dependencies":{"@worldcoin/idkit-core":"^4.2.0"},"description":"RP sign/verify backend for the Fathom Club iOS app. Signs rp_context with the Fathom RP signing key and verifies IDKit session proofs against the World Developer Portal.","main":"server.mjs","name":"fathom-gate","private":true,"type":"module","version":"1.0.0"}
