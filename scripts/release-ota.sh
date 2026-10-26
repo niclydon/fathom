@@ -16,6 +16,12 @@
 #   EXTRA_BUILD_SETTINGS  space-separated extra KEY=value build settings
 #                         (use this to inject release-time secrets and URLs
 #                         that project.yml references; never commit them)
+#   ASC_KEY_PATH / ASC_KEY_ID / ASC_ISSUER_ID
+#                         an App Store Connect API key; when set, it is
+#                         passed to xcodebuild so -allowProvisioningUpdates
+#                         can create/update provisioning profiles (needed
+#                         the first time, and whenever a capability such
+#                         as NFC is added) without a signed-in Xcode account.
 #
 # Note: xcodebuild archive run over an SSH (non-GUI) session can fail
 # codesigning with errSecInternalComponent. If that happens, run this
@@ -41,13 +47,17 @@ EXTRA_ARGS=()
 if [ -n "${DEVELOPMENT_TEAM:-}" ]; then EXTRA_ARGS+=("DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM"); fi
 if [ -n "${BUNDLE_ID_SETTING:-}" ]; then EXTRA_ARGS+=("PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID_SETTING"); fi
 for spec in ${=EXTRA_BUILD_SETTINGS:-}; do EXTRA_ARGS+=("$spec"); done
+AUTH_ARGS=()
+if [ -n "${ASC_KEY_PATH:-}" ] && [ -n "${ASC_KEY_ID:-}" ] && [ -n "${ASC_ISSUER_ID:-}" ]; then
+  AUTH_ARGS+=(-authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+fi
 
 echo "==> generate + archive ($APP build $BUILD)"
 xcodegen generate >/dev/null
 rm -rf "build/$APP.xcarchive"
 xcodebuild archive -project "$APP.xcodeproj" -scheme "$SCHEME" \
   -archivePath "build/$APP.xcarchive" -destination 'generic/platform=iOS' \
-  CURRENT_PROJECT_VERSION="$BUILD" "${EXTRA_ARGS[@]}" -allowProvisioningUpdates -quiet
+  CURRENT_PROJECT_VERSION="$BUILD" "${EXTRA_ARGS[@]}" "${AUTH_ARGS[@]}" -allowProvisioningUpdates -quiet
 
 APPDIR="build/$APP.xcarchive/Products/Applications/$APP.app"
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APPDIR/Info.plist")
