@@ -48,9 +48,17 @@ extension Data {
 
 /// Core NFC tag scanner for the Descent.
 ///
-/// Polls ISO 14443, ISO 15693 and FeliCa (ISO 18092), connects to the
-/// first tag, reads its identifier per type, and reads the full NDEF
-/// message. It never writes to a tag.
+/// Polls ISO 14443 and ISO 15693, connects to the first tag, reads its
+/// identifier per type, and reads the full NDEF message. It never
+/// writes to a tag.
+///
+/// FeliCa (ISO 18092) polling is deliberately not enabled: iOS requires
+/// a separate iso18092 system-codes entitlement for it, and a session
+/// that asks for ISO 18092 without that entitlement is invalidated with
+/// "Missing required entitlement" (found the hard way on the first
+/// spike build, Oct 26, 2026). The chips this gate targets are ISO
+/// 14443, so nothing is lost. The FeliCa branch in the tag switch stays
+/// for completeness if the entitlement is ever added.
 ///
 /// Tier-1 possession factor, honestly: the identifier and the NDEF
 /// message are static and cloneable. This scan proves the enrolled
@@ -74,7 +82,7 @@ final class ChipScanner: NSObject, ObservableObject {
         }
         lastError = nil
         self.completion = completion
-        let newSession = NFCTagReaderSession(pollingOption: [.iso14443, .iso15693, .iso18092], delegate: self, queue: nil)
+        let newSession = NFCTagReaderSession(pollingOption: [.iso14443, .iso15693], delegate: self, queue: nil)
         newSession?.alertMessage = "Hold the top edge of your phone to your mark."
         self.session = newSession
         isScanning = true
