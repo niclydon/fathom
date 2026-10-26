@@ -1,0 +1,15 @@
+# Xcode
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+build/
+*.ipa
+*.dSYM.zip
+.DS_Store
+
+# Local release configuration (never committed: tokens, team, gate URL)
+.ota-token
+.release-env
+Fathom/Fathom.entitlements.local
+backend/.env
