@@ -148,30 +148,56 @@ final class WorldIDClient: @unchecked Sendable {
             }
 
             onStatus?("Waiting for the World App to finish.")
-            let status = await Task.detached { request.pollStatus(pollIntervalMs: 2000, timeoutMs: 300_000) }.value
-            switch status {
-            case .confirmed(let result):
-                onStatus?("Verifying the proof with the gate backend.")
-                let resultJSON = try idkitResultToJson(result: result)
-                guard let resultObject = try JSONSerialization.jsonObject(with: Data(resultJSON.utf8)) as? [String: Any] else {
-                    return .failure(.failed("Could not read the World ID result."))
+            // Poll the bridge ourselves with one-shot status fetches.
+            //
+            // The SDK's UniFFI pollStatus(pollIntervalMs:timeoutMs:)
+            // looks like a blocking poll, but the generated bindings
+            // document it as a single status fetch whose interval and
+            // timeout arguments are ignored. v0.1 called it once and
+            // read the snapshot (still waiting) as a timeout, so every
+            // proof "timed out" no matter how fast it completed. This
+            // loop is the SDK wrapper's own pattern (pollStatusOnce
+            // until a terminal state); each fetch is a fresh bridge
+            // call, so it also survives the app being suspended while
+            // the World App runs the face check.
+            let deadline = Date().addingTimeInterval(360)
+            var polls = 0
+            var networkingStrikes = 0
+            while true {
+                if Date() > deadline {
+                    return .failure(.failed("The World ID check timed out before it finished (\(polls) bridge checks)."))
                 }
-                var body: [String: Any] = ["flow": enrolled ? "prove" : "enroll", "result": resultObject]
-                if let savedSessionID { body["expected_session_id"] = savedSessionID }
-                let verified = try await backendPost("verify", body: body)
-                guard verified["verified"] as? Bool == true else {
-                    return .failure(.failed("The gate backend did not verify that proof."))
+                let status = await Task.detached { request.pollStatusOnce() }.value
+                polls += 1
+                switch status {
+                case .confirmed(let result):
+                    onStatus?("Verifying the proof with the gate backend.")
+                    let resultJSON = try idkitResultToJson(result: result)
+                    guard let resultObject = try JSONSerialization.jsonObject(with: Data(resultJSON.utf8)) as? [String: Any] else {
+                        return .failure(.failed("Could not read the World ID result."))
+                    }
+                    var body: [String: Any] = ["flow": enrolled ? "prove" : "enroll", "result": resultObject]
+                    if let savedSessionID { body["expected_session_id"] = savedSessionID }
+                    let verified = try await backendPost("verify", body: body)
+                    guard verified["verified"] as? Bool == true else {
+                        return .failure(.failed("The gate backend did not verify that proof."))
+                    }
+                    if let sessionID = verified["session_id"] as? String {
+                        keychain.write("world_session_id", sessionID)
+                    }
+                    return .success(())
+                case .failed(let error):
+                    return .failure(.failed("World ID check failed (\(String(describing: error)))."))
+                case .networkingError(let error):
+                    networkingStrikes += 1
+                    if networkingStrikes > 10 {
+                        return .failure(.failed("World ID check hit a network problem (\(String(describing: error)))."))
+                    }
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                case .waitingForConnection, .awaitingConfirmation:
+                    networkingStrikes = 0
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
                 }
-                if let sessionID = verified["session_id"] as? String {
-                    keychain.write("world_session_id", sessionID)
-                }
-                return .success(())
-            case .failed(let error):
-                return .failure(.failed("World ID check failed (\(String(describing: error)))."))
-            case .networkingError(let error):
-                return .failure(.failed("World ID check hit a network problem (\(String(describing: error)))."))
-            case .waitingForConnection, .awaitingConfirmation:
-                return .failure(.failed("The World ID check timed out before it finished."))
             }
         } catch let error as GateError {
             return .failure(error)
